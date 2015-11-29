@@ -1,0 +1,8 @@
+[package]
+name = "interner"
+version = "0.1.0"
+authors = ["Andrew Cann <shum@canndrew.org>"]
+
+[dependencies]
+rust-crypto = "*"
+
