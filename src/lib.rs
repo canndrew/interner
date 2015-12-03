@@ -1,6 +1,6 @@
 extern crate crypto;
 
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::slice;
 use std::borrow::Borrow;
@@ -8,10 +8,15 @@ use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::Mutex;
+use std::fmt;
 use std::collections::{hash_map, HashMap};
 
 use crypto::sha1;
 use crypto::digest::Digest;
+
+unsafe fn extend_lifetime<'b, T: 'b>(data: &T) -> &'b T {
+    mem::transmute(data)
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct InternKey {
@@ -38,6 +43,12 @@ impl InternKey {
     }
 }
 
+impl fmt::Display for InternKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:x}{:x}{:x}{:x}{:x}", self.data[0], self.data[1], self.data[2], self.data[3], self.data[4])
+    }
+}
+
 struct InternField<T> {
     count: AtomicUsize,
     data: T,
@@ -50,7 +61,7 @@ pub struct Interner<T> {
 pub struct Interned<'a, T: 'a> {
     key: InternKey,
     interner: &'a Interner<T>,
-    field: *const InternField<T>,
+    field: &'a InternField<T>,
 }
 
 impl<T: Hash> Interner<T> {
@@ -60,7 +71,10 @@ impl<T: Hash> Interner<T> {
         }
     }
 
-    fn intern_with<'a, F: FnOnce() -> T>(&'a self, key: InternKey, f: F) -> Interned<'a, T> {
+    fn intern_with<'a, F>(&'a self, key: InternKey, f: F) -> Interned<'a, T>
+            where F: FnOnce() -> T,
+                  T: 'a
+    {
         let mut map = self.map.lock().unwrap();
         let entry = map.entry(key.clone());
         let field = match entry {
@@ -71,21 +85,24 @@ impl<T: Hash> Interner<T> {
             }),
         };
         field.count.fetch_add(1, Relaxed);
+        let field: &'a InternField<T> = unsafe { extend_lifetime(field) };
         Interned {
             key: key,
             interner: self,
-            field: field as *const InternField<T>,
+            field: field,
         }
     }
 
-    pub fn intern<'a>(&'a self, data: T) -> Interned<'a, T> {
+    pub fn intern<'a>(&'a self, data: T) -> Interned<'a, T>
+            where T: 'a
+    {
         let key = InternKey::hash(&data);
         self.intern_with(key, || data)
     }
 
     pub fn intern_borrowed<'a, B: ?Sized>(&'a self, data: &B) -> Interned<'a, T>
             where B: Hash + ToOwned<Owned=T>,
-                  T: Hash + Borrow<B>
+                  T: Hash + Borrow<B> + 'a
     {
         let key = InternKey::hash(data);
         self.intern_with(key, || data.to_owned())
@@ -96,15 +113,13 @@ impl<'a, T> Deref for Interned<'a, T> {
     type Target = T;
 
     fn deref<'b>(&'b self) -> &'b T {
-        let field: &'b InternField<T> = unsafe { mem::transmute(self.field) };
-        &field.data
+        &self.field.data
     }
 }
 
 impl<'a, T> Drop for Interned<'a, T> {
     fn drop<'b>(&'b mut self) {
-        let field: &'b InternField<T> = unsafe { mem::transmute(self.field) };
-        if 1 == field.count.fetch_sub(1, Relaxed) {
+        if 1 == self.field.count.fetch_sub(1, Relaxed) {
             let mut map = self.interner.map.lock().unwrap();
             let entry = map.entry(self.key.clone());
             match entry {
@@ -119,9 +134,52 @@ impl<'a, T> Drop for Interned<'a, T> {
     }
 }
 
+impl<'a, T> Hash for Interned<'a, T> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.key.hash(hasher);
+    }
+}
+
+impl<'a, T> PartialEq for Interned<'a, T> {
+    fn eq(&self, other: &Interned<'a, T>) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<'a, T> Clone for Interned<'a, T> {
+    fn clone(&self) -> Interned<'a, T> {
+        self.field.count.fetch_add(1, Relaxed);
+        Interned {
+            key: self.key.clone(),
+            interner: self.interner,
+            field: self.field,
+        }
+    }
+}
+
+impl<'a, T: fmt::Debug> fmt::Debug for Interned<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        try!(write!(f, "Interned[{}] ", self.key));
+        self.field.data.fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Interner;
+
+    #[derive(Hash)]
+    enum Foo<'i> {
+        FooNone,
+        FooSome(super::Interned<'i, Foo<'i>>),
+    }
+
+    #[test]
+    fn recursive() {
+        let interner = Interner::new();
+        let interned = interner.intern(Foo::FooNone);
+        let _ = interner.intern(Foo::FooSome(interned));
+    }
 
     #[test]
     fn intern_strings() {
